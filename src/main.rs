@@ -13,6 +13,8 @@
 
 mod pin_wrappers;
 
+use cortex_m::delay::Delay;
+use cyw43::NetDevice;
 use rp_pico_w::entry;
 use hal::gpio::dynpin::DynPin;
 
@@ -20,7 +22,7 @@ use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
 use pin_wrappers::InOutPin;
-use rp_pico_w::hal::pac;
+use rp_pico_w::hal::{Clock, pac, Sio};
 
 use rp_pico_w::gspi::GSpi;
 use rp_pico_w::hal;
@@ -32,7 +34,22 @@ use embassy_executor::raw::TaskPool;
 use embassy_executor::Executor;
 use embassy_executor::Spawner;
 use embassy_net::Stack;
+use embassy_net::tcp::TcpSocket;
 use embassy_time::{Duration, Timer};
+use rp_pico_w::hal::multicore::Multicore;
+
+/// Stack for core 1
+///
+/// Core 0 gets its stack via the normal route - any memory not used by static
+/// values is reserved for stack and initialised by cortex-m-rt.
+/// To get the same for Core 1, we would need to compile everything seperately
+/// and modify the linker file for both programs, and that's quite annoying.
+/// So instead, core1.spawn takes a [usize] which gets used for the stack.
+/// NOTE: We use the `Stack` struct here to ensure that it has 32-byte
+/// alignment, which allows the stack guard to take up the least amount of
+/// usable RAM.
+static mut CORE1_STACK: hal::multicore::Stack<4096> = hal::multicore::Stack::new();
+
 
 /// The function configures the RP2040 peripherals, initializes
 /// networking, then blinks the LED in an infinite loop.
@@ -62,7 +79,7 @@ fn main() -> ! {
         .ok()
         .unwrap();
 
-    let sio = hal::Sio::new(pac.SIO);
+    let mut sio = hal::Sio::new(pac.SIO);
 
     let pins = rp_pico_w::Pins::new(
         pac.IO_BANK0,
@@ -70,6 +87,14 @@ fn main() -> ! {
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
+    let sys_freq = _clocks.system_clock.freq().to_Hz();
+    // Start up the second core to blink the second LED
+    let mut mc = Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
+    let cores = mc.cores();
+    let core1 = &mut cores[1];
+    let _test = core1.spawn(unsafe { &mut CORE1_STACK.mem }, move || {
+        core1_task(sys_freq)
+    });
 
     info!("init time driver");
     let timer = hal::timer::Timer::new(pac.TIMER, &mut pac.RESETS);
@@ -91,6 +116,80 @@ fn main() -> ! {
         let spawn_token = task_pool.spawn(|| run(spawner, pins, state));
         spawner.spawn(spawn_token).unwrap();
     });
+}
+
+///Core 1 runs the stepper motor and laser logic
+fn core1_task(sys_freq: u32) -> ! {
+    let mut pac = unsafe { pac::Peripherals::steal() };
+    let core = unsafe { pac::CorePeripherals::steal() };
+
+    let mut sio = Sio::new(pac.SIO);
+    let pins = hal::gpio::Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
+
+    let mut delay = cortex_m::delay::Delay::new(core.SYST, sys_freq);
+
+    // Pins for the stepper motor
+    let in1 = InOutPin::new(pins.gpio18.into());
+    let in2 = InOutPin::new(pins.gpio19.into());
+    let in3 = InOutPin::new(pins.gpio20.into());
+    let in4 = InOutPin::new(pins.gpio21.into());
+
+    // Stepper motor sequence to turn clockwise
+    let clockwise_sequence = [
+        [1,0,0,0],
+        [0,1,0,0],
+        [0,0,1,0],
+        [0,0,0,1],
+    ];
+
+    let counter_clockwise_sequence = [
+        [0,0,0,1],
+        [0,0,1,0],
+        [0,1,0,0],
+        [1,0,0,0],
+    ];
+    let mut motor_pins = [in1, in2, in3, in4];
+
+
+
+    loop {
+        // info!("core1_task:");
+        run_the_motor(counter_clockwise_sequence, &mut motor_pins, &mut delay);
+
+        // let input = sio.fifo.read();
+        // if let Some(word) = input {
+        //     delay.delay_ms(word);
+        //     // led_pin.toggle().unwrap();
+        //     // sio.fifo.write_blocking(CORE1_TASK_COMPLETE);
+        // };
+    }
+}
+
+/// Runs the motor with the given sequence
+fn run_the_motor(sequence: [[u8; 4]; 4], motor_pins: &mut [InOutPin; 4], mut delay: &mut Delay) {
+    for step in &sequence {
+        for (i, &value) in step.iter().enumerate() {
+            set_pin_value(&mut motor_pins[i], value);
+            //5 Slow
+            //2 Fast
+            // Timer::after(Duration::from_millis(2)).await
+            delay.delay_ms(2)
+        }
+    }
+}
+
+/// Sets the value of the given pin
+fn set_pin_value(pin: &mut InOutPin, value: u8) {
+    if value == 1 {
+        pin.set_high().unwrap();
+    } else {
+        pin.set_low().unwrap();
+    }
 }
 
 // TODO documentation
@@ -180,6 +279,9 @@ async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::Sta
     let task_pool: TaskPool<_, 1> = TaskPool::new();
     let task_pool = unsafe { forever(&task_pool) };
     let spawn_token = task_pool.spawn(|| stack.run());
+    let spawn_token_two = task_pool.spawn(|| loop{
+
+    });
     spawner.spawn(spawn_token).unwrap();
 
     //Socket buffers
@@ -188,50 +290,58 @@ async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::Sta
     let mut buf = [0; 4096];
 
 
-
-    // Pins for the stepper motor
-    let in1 = InOutPin::new(pins.gpio18.into());
-    let in2 = InOutPin::new(pins.gpio19.into());
-    let in3 = InOutPin::new(pins.gpio20.into());
-    let in4 = InOutPin::new(pins.gpio21.into());
-
-    // Stepper motor sequence to turn clockwise
-    let clockwise_sequence = [
-        [1,0,0,0],
-        [0,1,0,0],
-        [0,0,1,0],
-        [0,0,0,1],
-    ];
-
-    let counter_clockwise_sequence = [
-        [0,0,0,1],
-        [0,0,1,0],
-        [0,1,0,0],
-        [1,0,0,0],
-    ];
-    let mut motor_pins = [in1, in2, in3, in4];
-
-
-    //Program loop
+    //Program loop running networking
     loop {
-        run_the_motor(counter_clockwise_sequence, &mut motor_pins).await;
-    }
 
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(embassy_net::SmolDuration::from_secs(10)));
 
-    async fn run_the_motor(sequence: [[u8; 4]; 4], mut motor_pins: &mut [InOutPin; 4]) {
-        for step in &sequence {
-            for (i, &value) in step.iter().enumerate() {
-                set_pin_value(&mut motor_pins[i], value);
-                Timer::after(Duration::from_millis(5)).await
-            }
+        info!("Listening on TCP:1234...");
+        if let Err(e) = socket.accept(1234).await {
+            warn!("accept error: {:?}", e);
+            continue;
         }
+
+        info!("Received connection from {:?}", socket.remote_endpoint());
+
+        loop {
+
+
+            let n = match socket.read(&mut buf).await {
+                Ok(0) => {
+                    warn!("read EOF");
+                    break;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("read error: {:?}", e);
+                    break;
+                }
+            };
+
+            info!("rxd {:02x}", &buf[..n]);
+            // match socket.write() { }
+            //
+            match socket.write(&buf[..n]).await {
+                Ok(_0) => {
+                    info!("wrote");
+                    "Hello World!"
+                }
+                Err(e) => {
+                    warn!("write error: {:?}", e);
+                    break;
+                }
+            };
+
+        }
+
+
     }
 
-    fn set_pin_value(pin: &mut InOutPin, value: u8) {
-        if value == 1 {
-            pin.set_high().unwrap();
-        } else {
-            pin.set_low().unwrap();
-        }
-    }
+
+
+
+
+
+
 }
