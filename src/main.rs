@@ -10,18 +10,23 @@
 #![no_std]
 #![no_main]
 
+
+mod pin_wrappers;
+
 use rp_pico_w::entry;
+use hal::gpio::dynpin::DynPin;
 
 use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
-
+use pin_wrappers::InOutPin;
 use rp_pico_w::hal::pac;
 
 use rp_pico_w::gspi::GSpi;
 use rp_pico_w::hal;
 
 use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::digital::v2::InputPin;
 
 use embassy_executor::raw::TaskPool;
 use embassy_executor::Executor;
@@ -177,14 +182,56 @@ async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::Sta
     let spawn_token = task_pool.spawn(|| stack.run());
     spawner.spawn(spawn_token).unwrap();
 
-    // Blink the LED at 1 Hz
-    loop {
-        info!("on");
-        control.gpio_set(0, true).await;
-        Timer::after(Duration::from_millis(500)).await;
+    //Socket buffers
+    let mut rx_buffer = [0; 4096];
+    let mut tx_buffer = [0; 4096];
+    let mut buf = [0; 4096];
 
-        info!("off");
-        control.gpio_set(0, false).await;
-        Timer::after(Duration::from_millis(500)).await;
+
+
+    // Pins for the stepper motor
+    let in1 = InOutPin::new(pins.gpio18.into());
+    let in2 = InOutPin::new(pins.gpio19.into());
+    let in3 = InOutPin::new(pins.gpio20.into());
+    let in4 = InOutPin::new(pins.gpio21.into());
+
+    // Stepper motor sequence to turn clockwise
+    let clockwise_sequence = [
+        [1,0,0,0],
+        [0,1,0,0],
+        [0,0,1,0],
+        [0,0,0,1],
+    ];
+
+    let counter_clockwise_sequence = [
+        [0,0,0,1],
+        [0,0,1,0],
+        [0,1,0,0],
+        [1,0,0,0],
+    ];
+    let mut motor_pins = [in1, in2, in3, in4];
+
+
+    //Program loop
+    loop {
+        run_the_motor(counter_clockwise_sequence, &mut motor_pins).await;
+    }
+
+
+    async fn run_the_motor(sequence: [[u8; 4]; 4], mut motor_pins: &mut [InOutPin; 4]) {
+        for step in &sequence {
+            for (i, &value) in step.iter().enumerate() {
+                set_pin_value(&mut motor_pins[i], value);
+                Timer::after(Duration::from_millis(5)).await
+            }
+        }
+    }
+
+    fn set_pin_value(pin: &mut InOutPin, value: u8) {
+        if value == 1 {
+            pin.set_high().unwrap();
+        } else {
+            pin.set_low().unwrap();
+        }
     }
 }
