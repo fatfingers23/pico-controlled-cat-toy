@@ -11,8 +11,11 @@
 #![no_main]
 
 
+
 mod pin_wrappers;
 
+
+use core::str::Lines;
 use cortex_m::delay::Delay;
 use cyw43::NetDevice;
 use rp_pico_w::entry;
@@ -38,6 +41,8 @@ use embassy_net::tcp::TcpSocket;
 use embassy_time::{Duration, Timer};
 use rp_pico_w::hal::multicore::Multicore;
 
+
+//https://github.com/rp-rs/rp-hal/blob/9b7acef8c0145cc595ef5861756fe5be5d99c8b2/rp2040-hal/examples/multicore_fifo_blink.rs#L55
 /// Stack for core 1
 ///
 /// Core 0 gets its stack via the normal route - any memory not used by static
@@ -49,7 +54,6 @@ use rp_pico_w::hal::multicore::Multicore;
 /// alignment, which allows the stack guard to take up the least amount of
 /// usable RAM.
 static mut CORE1_STACK: hal::multicore::Stack<4096> = hal::multicore::Stack::new();
-
 
 
 const CORE1_TASK_START: u32 = 0xFF;
@@ -144,17 +148,17 @@ fn core1_physical_tasks(sys_freq: u32) -> ! {
 
     // Stepper motor sequence to turn clockwise
     let clockwise_sequence = [
-        [1,0,0,0],
-        [0,1,0,0],
-        [0,0,1,0],
-        [0,0,0,1],
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1],
     ];
 
     let counter_clockwise_sequence = [
-        [0,0,0,1],
-        [0,0,1,0],
-        [0,1,0,0],
-        [1,0,0,0],
+        [0, 0, 0, 1],
+        [0, 0, 1, 0],
+        [0, 1, 0, 0],
+        [1, 0, 0, 0],
     ];
     let mut motor_pins = [in1, in2, in3, in4];
 
@@ -174,18 +178,6 @@ fn core1_physical_tasks(sys_freq: u32) -> ! {
             run_the_motor(clockwise_sequence, &mut motor_pins, &mut delay);
         }
     }
-
-    // loop {
-    //     // info!("core1_task:");
-    //     run_the_motor(counter_clockwise_sequence, &mut motor_pins, &mut delay);
-    //
-    //     // let input = sio.fifo.read();
-    //     // if let Some(word) = input {
-    //     //     delay.delay_ms(word);
-    //     //     // led_pin.toggle().unwrap();
-    //     //     // sio.fifo.write_blocking(CORE1_TASK_COMPLETE);
-    //     // };
-    // }
 }
 
 /// Runs the motor with the given sequence
@@ -221,6 +213,12 @@ unsafe fn forever<T>(r: &'_ T) -> &'static T {
 }
 
 async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::State) -> ! {
+
+    //Going mark boiler plate code and link to the original repo.
+
+    //Start of boiler plate code and code i did not write for this project
+    //https://github.com/jannic/rp-hal/blob/pico-w/boards/rp-pico-w/examples/pico_w_blinky.rs
+
     // These are implicitly used by the spi driver if they are in the correct mode
     let mut spi_cs: hal::gpio::dynpin::DynPin = pins.wl_cs.into();
     // TODO should be high from the beginning :-(
@@ -278,11 +276,7 @@ async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::Sta
         warn!("Environment variable WIFI_NETWORK not set during compilation - not joining wireless network");
     }
     let config = embassy_net::ConfigStrategy::Dhcp;
-    //let config = embassy_net::ConfigStrategy::Static(embassy_net::Config {
-    //    address: Ipv4Cidr::new(Ipv4Address::new(192, 168, 69, 2), 24),
-    //    dns_servers: Vec::new(),
-    //    gateway: Some(Ipv4Address::new(192, 168, 69, 1)),
-    //});
+
 
     // Generate random seed
     let seed = 0x0123_4567_89ab_cdef; // chosen by fair dice roll. guarenteed to be random.
@@ -297,9 +291,7 @@ async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::Sta
     let task_pool: TaskPool<_, 1> = TaskPool::new();
     let task_pool = unsafe { forever(&task_pool) };
     let spawn_token = task_pool.spawn(|| stack.run());
-    let spawn_token_two = task_pool.spawn(|| loop{
-
-    });
+    let spawn_token_two = task_pool.spawn(|| loop {});
     spawner.spawn(spawn_token).unwrap();
 
     //Socket buffers
@@ -310,9 +302,11 @@ async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::Sta
     let mut pac = unsafe { pac::Peripherals::steal() };
     let mut sio = Sio::new(pac.SIO);
 
+    //End of boiler plate code
+
+
     //Program loop running networking
     loop {
-
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(embassy_net::SmolDuration::from_secs(10)));
 
@@ -325,8 +319,6 @@ async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::Sta
         info!("Received connection from {:?}", socket.remote_endpoint());
 
         loop {
-
-
             let n = match socket.read(&mut buf).await {
                 Ok(0) => {
                     warn!("read EOF");
@@ -339,8 +331,23 @@ async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::Sta
                 }
             };
 
+
+            let request = request_parser(&buf[..n]);
+            match request.path {
+                "/on" => {
+                    sio.fifo.write_blocking(CORE1_TASK_START);
+                },
+                "/off" => {
+                    sio.fifo.write_blocking(CORE1_TASK_STOP);
+                },
+                &_ => {
+
+                }
+            }
+            // info!("rxd {:?}", request);
+            // info!("rxd {:02x}", &buf[..n]);
             // let input = sio.fifo.read();
-            sio.fifo.write_blocking(CORE1_TASK_START);
+
             //
 
             info!("rxd {:02x}", &buf[..n]);
@@ -355,12 +362,56 @@ async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::Sta
                     break;
                 }
             };
-
             socket.close();
-
         }
+    }
 
 
+
+
+
+    fn request_parser(request: &[u8]) -> NonStdRequest {
+        let request_string = core::str::from_utf8(request).unwrap();
+        info!("request_string {:?}", request_string);
+        let mut lines = request_string.lines();
+        let first_line = lines.next().unwrap();
+        let mut first_line_words = first_line.split_whitespace();
+        let method = match first_line_words.next().unwrap() {
+            "POST" => HttpMethod::POST,
+            "GET" => HttpMethod::Get,
+            _ => HttpMethod::Unsupported,
+        };
+        let path = first_line_words.next().unwrap();
+        let version = first_line_words.next().unwrap();
+
+        //TODO need to read till content length. Parse number read that many bytes
+        // let body = lines.next().unwrap();
+
+        // info!("method {:?}", method);
+        info!("path {:?}", path);
+        info!("version {:?}", version);
+
+
+        NonStdRequest {
+            method,
+            path,
+            version,
+            // body,
+        }
+    }
+
+
+    pub enum HttpMethod {
+        POST,
+        Get,
+        Unsupported,
+    }
+
+    struct NonStdRequest<'a> {
+        method: HttpMethod,
+        path: &'a str,
+        version: &'a str,
+        // body: &'a str,
     }
 
 
