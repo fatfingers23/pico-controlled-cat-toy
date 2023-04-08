@@ -51,9 +51,11 @@ use rp_pico_w::hal::multicore::Multicore;
 static mut CORE1_STACK: hal::multicore::Stack<4096> = hal::multicore::Stack::new();
 
 
+
+const CORE1_TASK_START: u32 = 0xFF;
+const CORE1_TASK_STOP: u32 = 0xEE;
+
 /// The function configures the RP2040 peripherals, initializes
-/// networking, then blinks the LED in an infinite loop.
-/// TODO: add some simple network service
 #[entry]
 fn main() -> ! {
     info!("start");
@@ -88,12 +90,13 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
     let sys_freq = _clocks.system_clock.freq().to_Hz();
-    // Start up the second core to blink the second LED
+
+    // Start up the second core to control the stepper motor and laser
     let mut mc = Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
     let cores = mc.cores();
     let core1 = &mut cores[1];
     let _test = core1.spawn(unsafe { &mut CORE1_STACK.mem }, move || {
-        core1_task(sys_freq)
+        core1_physical_tasks(sys_freq)
     });
 
     info!("init time driver");
@@ -119,7 +122,7 @@ fn main() -> ! {
 }
 
 ///Core 1 runs the stepper motor and laser logic
-fn core1_task(sys_freq: u32) -> ! {
+fn core1_physical_tasks(sys_freq: u32) -> ! {
     let mut pac = unsafe { pac::Peripherals::steal() };
     let core = unsafe { pac::CorePeripherals::steal() };
 
@@ -155,19 +158,34 @@ fn core1_task(sys_freq: u32) -> ! {
     ];
     let mut motor_pins = [in1, in2, in3, in4];
 
-
+    let mut running = false;
 
     loop {
-        // info!("core1_task:");
-        run_the_motor(counter_clockwise_sequence, &mut motor_pins, &mut delay);
+        let input = sio.fifo.read();
+        if let Some(word) = input {
+            if word == CORE1_TASK_START {
+                running = true;
+            } else if word == CORE1_TASK_STOP {
+                running = false;
+            }
+        };
 
-        // let input = sio.fifo.read();
-        // if let Some(word) = input {
-        //     delay.delay_ms(word);
-        //     // led_pin.toggle().unwrap();
-        //     // sio.fifo.write_blocking(CORE1_TASK_COMPLETE);
-        // };
+        if running {
+            run_the_motor(clockwise_sequence, &mut motor_pins, &mut delay);
+        }
     }
+
+    // loop {
+    //     // info!("core1_task:");
+    //     run_the_motor(counter_clockwise_sequence, &mut motor_pins, &mut delay);
+    //
+    //     // let input = sio.fifo.read();
+    //     // if let Some(word) = input {
+    //     //     delay.delay_ms(word);
+    //     //     // led_pin.toggle().unwrap();
+    //     //     // sio.fifo.write_blocking(CORE1_TASK_COMPLETE);
+    //     // };
+    // }
 }
 
 /// Runs the motor with the given sequence
@@ -289,6 +307,8 @@ async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::Sta
     let mut tx_buffer = [0; 4096];
     let mut buf = [0; 4096];
 
+    let mut pac = unsafe { pac::Peripherals::steal() };
+    let mut sio = Sio::new(pac.SIO);
 
     //Program loop running networking
     loop {
@@ -319,28 +339,29 @@ async fn run(spawner: Spawner, pins: rp_pico_w::Pins, state: &'static cyw43::Sta
                 }
             };
 
+            // let input = sio.fifo.read();
+            sio.fifo.write_blocking(CORE1_TASK_START);
+            //
+
             info!("rxd {:02x}", &buf[..n]);
             // match socket.write() { }
             //
-            match socket.write(&buf[..n]).await {
-                Ok(_0) => {
-                    info!("wrote");
-                    "Hello World!"
-                }
+            let response = "HTTP/1.1 200 OK\r\n\r\nHello World!";
+
+            match socket.write(response.as_bytes()).await {
+                Ok(n) => {}
                 Err(e) => {
                     warn!("write error: {:?}", e);
                     break;
                 }
             };
 
+            socket.close();
+
         }
 
 
     }
-
-
-
-
 
 
 
